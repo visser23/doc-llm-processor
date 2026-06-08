@@ -45,9 +45,16 @@ python fast_processor.py --input-dir "src/my-project" --output-dir "output"
 Create a folder anywhere and pass it with `--input-dir`. The tool recursively scans for supported file types:
 
 - `.pdf` -- native text extraction, OCR fallback for scans
-- `.docx` -- paragraph extraction via python-docx
-- `.pptx` -- slide-by-slide text extraction
+- `.docx`, `.dotx` -- paragraph extraction via python-docx
+- `.pptx`, `.pptm` -- slide-by-slide text extraction
+- `.xlsx`, `.xlsm` -- sheet-by-sheet extraction via pandas/openpyxl
+- `.json`, `.jsonl` -- pretty-printed content
+- `.csv` -- read as text
+- `.html`, `.htm`, `.mht`, `.xml` -- read as text/markup
+- `.odt` -- OpenDocument text (requires optional `odfpy`)
 - `.txt`, `.md` -- read as-is
+
+Binary and media files (images, video, archives, diagrams) are automatically skipped and logged in the output summary. Legacy `.doc` files are also skipped (save as `.docx` to process).
 
 The `src/` directory in this repo is gitignored, so you can use it locally without risk of committing your documents.
 

@@ -6,6 +6,7 @@ Falls back to OCR only for truly scanned documents.
 """
 
 import os
+import sys
 import json
 import argparse
 import hashlib
@@ -16,6 +17,12 @@ from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 import multiprocessing
+
+# Prevent UnicodeEncodeError on Windows consoles (cp1252) when filenames contain emoji/unicode
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(errors='replace')
+if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(errors='replace')
 
 # Third-party imports
 import fitz  # PyMuPDF - fast native PDF extraction
@@ -101,12 +108,26 @@ def extract_document_date(file_path: Path, extracted_text: str = None) -> Option
         return None
 
 
+# Binary/media formats that can't be text-extracted — logged and skipped
+SKIPPABLE_EXTENSIONS = {
+    '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.ico', '.webp',
+    '.mp4', '.mov', '.avi', '.wmv', '.mkv', '.mp3', '.wav',
+    '.zip', '.rar', '.7z', '.tar', '.gz',
+    '.eps', '.ai', '.psd', '.indd',
+    '.svg', '.fig', '.drawio',
+    '.one', '.onetoc2',
+    '.url', '.lnk',
+    '.exe', '.dll', '.msi',
+}
+
+
 @dataclass
 class ProcessingStats:
     """Statistics for processing run."""
     total_files: int = 0
     successful: int = 0
     failed: int = 0
+    skipped: int = 0
     total_chunks: int = 0
     total_pages: int = 0
     processing_time_seconds: float = 0.0
@@ -146,6 +167,7 @@ class FastDocumentProcessor:
             enable_ocr_fallback: Whether to use OCR for scanned documents
         """
         self.input_dir = Path(input_dir)
+        self.input_dir_abs = Path(os.path.abspath(input_dir))
         self.output_dir = Path(output_dir)
         self.chunk_size = chunk_size
         self.overlap = overlap
@@ -157,22 +179,100 @@ class FastDocumentProcessor:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
         # Supported file extensions
-        self.supported_extensions = {'.pdf', '.docx', '.doc', '.pptx', '.ppt', '.txt', '.md'}
+        self.supported_extensions = {
+            '.pdf',
+            '.docx', '.dotx',
+            '.pptx', '.pptm', '.ppt',
+            '.xlsx', '.xlsm',
+            '.txt', '.md', '.csv', '.json', '.jsonl',
+            '.html', '.htm', '.mht', '.xml',
+            '.odt',
+            '.doc',
+        }
         
         # Track results
         self.stats = ProcessingStats()
         self.failed_files: List[Dict[str, str]] = []
+        self.skipped_files: List[Dict[str, str]] = []
         
+    def _relative_to_input(self, file_path: Path) -> str:
+        """Get path relative to input dir, handling Windows \\\\?\\ long-path prefix."""
+        try:
+            return str(file_path.relative_to(self.input_dir))
+        except ValueError:
+            pass
+        try:
+            return str(file_path.relative_to(self.input_dir_abs))
+        except ValueError:
+            pass
+        # Strip \\?\ prefix and try again
+        s = str(file_path)
+        if s.startswith('\\\\?\\'):
+            s = s[4:]
+        base = str(self.input_dir_abs)
+        if s.startswith(base):
+            rel = s[len(base):].lstrip('\\/')
+            return rel if rel else "."
+        return file_path.name
+
+    def _relative_dir(self, file_path: Path) -> str:
+        """Get the directory component relative to input dir."""
+        rel = self._relative_to_input(file_path)
+        parent = str(Path(rel).parent)
+        return parent if parent != "." else "."
+
     def get_file_hash(self, file_path: Path) -> str:
         """Generate MD5 hash for file tracking."""
         with open(file_path, 'rb') as f:
             return hashlib.md5(f.read()).hexdigest()
     
     def find_documents(self) -> List[Path]:
-        """Find all supported documents in input directory."""
+        """Find all supported documents, log skipped binary/media files."""
         documents = []
-        for ext in self.supported_extensions:
-            documents.extend(self.input_dir.rglob(f"*{ext}"))
+        skipped_by_ext: Dict[str, int] = {}
+        path_errors = 0
+
+        # Use os.walk with error handler for Windows long-path resilience
+        def _on_walk_error(err):
+            nonlocal path_errors
+            path_errors += 1
+            print(f"  Warning: cannot access directory (path too long?): {err}")
+
+        input_str = str(self.input_dir)
+        if os.name == 'nt' and not input_str.startswith('\\\\?\\'):
+            input_str = '\\\\?\\' + os.path.abspath(input_str)
+
+        for dirpath, _dirnames, filenames in os.walk(input_str, onerror=_on_walk_error):
+            for fname in filenames:
+                try:
+                    full_path = Path(os.path.join(dirpath, fname))
+                    ext = full_path.suffix.lower()
+
+                    if ext in self.supported_extensions:
+                        documents.append(full_path)
+                    elif ext in SKIPPABLE_EXTENSIONS:
+                        skipped_by_ext[ext] = skipped_by_ext.get(ext, 0) + 1
+                    elif ext:
+                        skipped_by_ext[ext] = skipped_by_ext.get(ext, 0) + 1
+                except (OSError, ValueError) as e:
+                    path_errors += 1
+                    print(f"  Warning: cannot access file {fname}: {e}")
+
+        if path_errors:
+            print(f"Warning: {path_errors} paths were inaccessible (likely too long for Windows)")
+
+        # Build skip list for summary (without storing every filename to keep memory light)
+        total_skipped = sum(skipped_by_ext.values())
+        if skipped_by_ext:
+            print(f"Skipped {total_skipped} files by type:")
+            for ext, count in sorted(skipped_by_ext.items(), key=lambda x: -x[1]):
+                print(f"  {ext}: {count}")
+                self.skipped_files.append({
+                    "file": f"({count} files)",
+                    "reason": f"Unsupported or binary format: {ext}"
+                })
+            self.stats.skipped = total_skipped
+
         return sorted(documents)
     
     # =========================================================================
@@ -283,7 +383,7 @@ class FastDocumentProcessor:
             return []
     
     def extract_text_file(self, file_path: Path) -> List[Dict[str, Any]]:
-        """Extract text from plain text files."""
+        """Extract text from plain text/markup files (.txt, .md, .html, .xml, .csv, .mht, etc.)."""
         try:
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                 text = f.read()
@@ -298,7 +398,77 @@ class FastDocumentProcessor:
         except Exception as e:
             print(f"  Error reading text file: {e}")
             return []
-    
+
+    def extract_json_file(self, file_path: Path) -> List[Dict[str, Any]]:
+        """Extract text from JSON/JSONL files by pretty-printing the content."""
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                raw = f.read()
+
+            if file_path.suffix.lower() == '.jsonl':
+                lines = [line.strip() for line in raw.splitlines() if line.strip()]
+                parsed = [json.loads(line) for line in lines]
+                text = json.dumps(parsed, indent=2, ensure_ascii=False)
+            else:
+                parsed = json.loads(raw)
+                text = json.dumps(parsed, indent=2, ensure_ascii=False)
+
+            if text.strip():
+                return [{
+                    "page_number": 1,
+                    "text": text,
+                    "char_count": len(text)
+                }]
+            return []
+        except Exception as e:
+            print(f"  Error extracting JSON: {e}")
+            return []
+
+    def extract_xlsx(self, file_path: Path) -> List[Dict[str, Any]]:
+        """Extract text from Excel spreadsheets via pandas."""
+        try:
+            sheets = pd.read_excel(file_path, sheet_name=None, dtype=str)
+            pages = []
+
+            for sheet_idx, (sheet_name, df) in enumerate(sheets.items(), start=1):
+                df = df.fillna('')
+                header = " | ".join(str(c) for c in df.columns)
+                rows = []
+                for _, row in df.iterrows():
+                    rows.append(" | ".join(str(v) for v in row.values))
+                text = f"Sheet: {sheet_name}\n{header}\n" + "\n".join(rows)
+                if text.strip():
+                    pages.append({
+                        "page_number": sheet_idx,
+                        "text": text,
+                        "char_count": len(text)
+                    })
+
+            return pages
+        except Exception as e:
+            print(f"  Error extracting Excel: {e}")
+            return []
+
+    def extract_odt(self, file_path: Path) -> List[Dict[str, Any]]:
+        """Extract text from OpenDocument Text files."""
+        try:
+            from odf.opendocument import load as odf_load
+            from odf.text import P as OdfP
+            from odf import teletype
+
+            doc = odf_load(str(file_path))
+            paragraphs = doc.getElementsByType(OdfP)
+            text = "\n".join(teletype.extractText(p) for p in paragraphs)
+            if text.strip():
+                return [{"page_number": 1, "text": text, "char_count": len(text)}]
+            return []
+        except ImportError:
+            print(f"  Warning: odfpy not installed, skipping {file_path.name}")
+            return []
+        except Exception as e:
+            print(f"  Error extracting ODT: {e}")
+            return []
+
     # =========================================================================
     # SMART CHUNKING
     # =========================================================================
@@ -489,11 +659,25 @@ class FastDocumentProcessor:
                 pages, needs_ocr = self.extract_pdf_native(file_path)
                 if needs_ocr and self.enable_ocr_fallback:
                     pages = self.extract_with_ocr_fallback(file_path)
-            elif ext in ['.docx', '.doc']:
+            elif ext == '.doc':
+                print(f"  Skipping legacy .doc format (requires LibreOffice): {file_path.name}")
+                self.skipped_files.append({
+                    "file": self._relative_to_input(file_path),
+                    "reason": "Legacy .doc format — save as .docx to process"
+                })
+                self.stats.skipped += 1
+                return []
+            elif ext in ['.docx', '.dotx']:
                 pages = self.extract_docx(file_path)
-            elif ext in ['.pptx', '.ppt']:
+            elif ext in ['.pptx', '.pptm', '.ppt']:
                 pages = self.extract_pptx(file_path)
-            elif ext in ['.txt', '.md']:
+            elif ext in ['.xlsx', '.xlsm']:
+                pages = self.extract_xlsx(file_path)
+            elif ext in ['.json', '.jsonl']:
+                pages = self.extract_json_file(file_path)
+            elif ext == '.odt':
+                pages = self.extract_odt(file_path)
+            elif ext in ['.txt', '.md', '.csv', '.html', '.htm', '.mht', '.xml']:
                 pages = self.extract_text_file(file_path)
             else:
                 print(f"  Unsupported format: {ext}")
@@ -520,13 +704,13 @@ class FastDocumentProcessor:
                 for i, chunk in enumerate(page_chunks):
                     chunk_data = {
                         "chunk_id": f"{file_path.stem}_p{page_data['page_number']:03d}_c{i:03d}",
-                        "source_file": str(file_path.relative_to(self.input_dir)),
+                        "source_file": self._relative_to_input(file_path),
                         "file_hash": file_hash,
                         "chunk_index": len(all_chunks),
                         "text": chunk["text"],
                         "metadata": {
                             "filename": file_path.name,
-                            "file_directory": str(file_path.parent.relative_to(self.input_dir)) if file_path.parent != self.input_dir else ".",
+                            "file_directory": self._relative_dir(file_path),
                             "file_size_bytes": file_path.stat().st_size,
                             "page_number": chunk["source_page"],
                             "document_date": document_date,
@@ -628,6 +812,7 @@ class FastDocumentProcessor:
                 "total_documents": self.stats.total_files,
                 "successfully_processed": self.stats.successful,
                 "failed_documents": self.stats.failed,
+                "skipped_documents": self.stats.skipped,
                 "total_chunks": self.stats.total_chunks,
                 "total_pages": self.stats.total_pages,
                 "processing_timestamp": datetime.now().isoformat(),
@@ -641,6 +826,7 @@ class FastDocumentProcessor:
             },
             "chunks": all_chunks,
             "failed_files": self.failed_files,
+            "skipped_files": self.skipped_files,
             "file_index": self._create_file_index(all_chunks)
         }
         
@@ -731,20 +917,12 @@ class FastDocumentProcessor:
     def save_organized(self, knowledge_base: Dict[str, Any], max_content_files: int = 9):
         """
         Save output as index + grouped content files + flat JSONL.
-        Groups chunks by source subfolder, capped at max_content_files.
+        Groups chunks by top-level source subfolder, capped at max_content_files.
         Documents ordered newest-first within each file.
         """
         print(f"\nWriting organized output to: {self.output_dir}")
 
-        dir_groups: Dict[str, List[Dict[str, Any]]] = {}
-        for chunk in knowledge_base["chunks"]:
-            dir_key = chunk["metadata"]["file_directory"]
-            if dir_key not in dir_groups:
-                dir_groups[dir_key] = []
-            dir_groups[dir_key].append(chunk)
-
-        if len(dir_groups) > max_content_files:
-            dir_groups = self._merge_smallest_groups(dir_groups, max_content_files)
+        dir_groups = self._build_groups(knowledge_base["chunks"], max_content_files)
 
         content_files_meta = []
         for group_idx, (dir_name, chunks) in enumerate(
@@ -832,7 +1010,8 @@ class FastDocumentProcessor:
             ),
             "files": content_files_meta,
             "processing_stats": knowledge_base["metadata"],
-            "failed_files": knowledge_base["failed_files"]
+            "failed_files": knowledge_base["failed_files"],
+            "skipped_files": knowledge_base.get("skipped_files", [])
         }
         with open(self.output_dir / "00_index.json", 'w', encoding='utf-8') as f:
             json.dump(index, f, indent=2, ensure_ascii=False)
@@ -845,17 +1024,50 @@ class FastDocumentProcessor:
                 f.write(json.dumps(chunk, ensure_ascii=False) + '\n')
         print(f"  all_chunks.jsonl — {len(knowledge_base['chunks'])} chunks (flat)")
 
-    def _merge_smallest_groups(
-        self, dir_groups: Dict[str, list], max_groups: int
-    ) -> Dict[str, list]:
-        while len(dir_groups) > max_groups:
-            sorted_by_size = sorted(dir_groups.items(), key=lambda x: len(x[1]))
+    def _build_groups(
+        self, chunks: List[Dict[str, Any]], max_groups: int
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Group chunks by top-level subdirectory. If a top-level group is
+        dominant (>50% of chunks), split it into second-level subdirectories.
+        Then merge smallest groups if still over the cap.
+        """
+        total = len(chunks)
+
+        # First pass: group by top-level directory component
+        top_groups: Dict[str, List[Dict[str, Any]]] = {}
+        for chunk in chunks:
+            full_dir = chunk["metadata"]["file_directory"]
+            parts = Path(full_dir).parts
+            top_key = parts[0] if parts and parts[0] != "." else "."
+            if top_key not in top_groups:
+                top_groups[top_key] = []
+            top_groups[top_key].append(chunk)
+
+        # Second pass: split any dominant group into second-level subdirs
+        final_groups: Dict[str, List[Dict[str, Any]]] = {}
+        for top_key, group_chunks in top_groups.items():
+            if len(group_chunks) > total * 0.5 and top_key != ".":
+                sub_groups: Dict[str, List[Dict[str, Any]]] = {}
+                for chunk in group_chunks:
+                    full_dir = chunk["metadata"]["file_directory"]
+                    parts = Path(full_dir).parts
+                    sub_key = str(Path(*parts[:2])) if len(parts) >= 2 else top_key
+                    if sub_key not in sub_groups:
+                        sub_groups[sub_key] = []
+                    sub_groups[sub_key].append(chunk)
+                final_groups.update(sub_groups)
+            else:
+                final_groups[top_key] = group_chunks
+
+        # Merge smallest until within cap
+        while len(final_groups) > max_groups:
+            sorted_by_size = sorted(final_groups.items(), key=lambda x: len(x[1]))
             smallest_key = sorted_by_size[0][0]
-            other_key = "_merged"
-            if other_key not in dir_groups:
-                dir_groups[other_key] = []
-            dir_groups[other_key].extend(dir_groups.pop(smallest_key))
-        return dir_groups
+            second_key = sorted_by_size[1][0]
+            final_groups[second_key].extend(final_groups.pop(smallest_key))
+
+        return final_groups
 
     def _group_newest_date(self, chunks: List[Dict[str, Any]]) -> str:
         dates = [
@@ -940,21 +1152,32 @@ Examples:
     print("\n" + "="*60)
     print("PROCESSING COMPLETE")
     print("="*60)
-    print(f"Total documents:     {meta['total_documents']}")
-    print(f"Successfully processed: {meta['successfully_processed']}")
-    print(f"Failed:              {meta['failed_documents']}")
-    print(f"Total pages:         {meta['total_pages']}")
-    print(f"Total chunks:        {meta['total_chunks']}")
-    print(f"Processing time:     {meta['processing_time_seconds']:.2f} seconds")
-    print(f"Speed:               {meta['files_per_second']:.2f} files/second")
+    print(f"Total documents:       {meta['total_documents']}")
+    print(f"Successfully processed:  {meta['successfully_processed']}")
+    print(f"Failed:                {meta['failed_documents']}")
+    print(f"Skipped:               {meta['skipped_documents']}")
+    print(f"Total pages:           {meta['total_pages']}")
+    print(f"Total chunks:          {meta['total_chunks']}")
+    print(f"Processing time:       {meta['processing_time_seconds']:.2f} seconds")
+    print(f"Speed:                 {meta['files_per_second']:.2f} files/second")
     if meta['used_ocr_fallback'] > 0:
-        print(f"Used OCR fallback:   {meta['used_ocr_fallback']} files")
-    print(f"Output directory:    {args.output_dir}")
+        print(f"Used OCR fallback:     {meta['used_ocr_fallback']} files")
+    print(f"Output directory:      {args.output_dir}")
     
     if knowledge_base['failed_files']:
-        print(f"\nFailed files:")
-        for failed in knowledge_base['failed_files']:
+        print(f"\nFailed files ({len(knowledge_base['failed_files'])}):")
+        for failed in knowledge_base['failed_files'][:20]:
             print(f"  - {failed['file']}: {failed['error']}")
+        if len(knowledge_base['failed_files']) > 20:
+            print(f"  ... and {len(knowledge_base['failed_files']) - 20} more")
+
+    if knowledge_base.get('skipped_files'):
+        print(f"\nSkipped files ({len(knowledge_base['skipped_files'])}):")
+        reasons: Dict[str, int] = {}
+        for s in knowledge_base['skipped_files']:
+            reasons[s['reason']] = reasons.get(s['reason'], 0) + 1
+        for reason, count in sorted(reasons.items(), key=lambda x: -x[1]):
+            print(f"  {count}x {reason}")
 
 
 if __name__ == "__main__":
