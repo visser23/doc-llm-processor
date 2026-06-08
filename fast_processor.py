@@ -37,6 +37,70 @@ except ImportError:
     HAS_PPTX = False
 
 
+# =========================================================================
+# DOCUMENT DATE EXTRACTION
+# =========================================================================
+
+LARGE_FILE_THRESHOLD_BYTES = 512 * 1024  # 512KB
+
+_MONTH_FULL = r'(?:January|February|March|April|May|June|July|August|September|October|November|December)'
+_MONTH_ABBR = r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)'
+_ORDINAL = r'(?:st|nd|rd|th)'
+
+_DATE_PATTERNS = [
+    re.compile(r'\b(20[12]\d)[/-](0[1-9]|1[0-2])[/-](0[1-9]|[12]\d|3[01])\b'),
+    re.compile(rf'\b(\d{{1,2}}){_ORDINAL}?\s+{_MONTH_FULL}\s+(20[12]\d)\b', re.I),
+    re.compile(rf'\b{_MONTH_FULL}\s+(\d{{1,2}}){_ORDINAL}?,?\s+(20[12]\d)\b', re.I),
+    re.compile(rf'\b(\d{{1,2}}){_ORDINAL}?\s+{_MONTH_ABBR}\s+(20[12]\d)\b', re.I),
+    re.compile(rf'\b{_MONTH_ABBR}\s+(\d{{1,2}}){_ORDINAL}?,?\s+(20[12]\d)\b', re.I),
+    re.compile(rf'\b{_MONTH_FULL}\s+(20[12]\d)\b', re.I),
+    re.compile(rf'\b{_MONTH_ABBR}\s+(20[12]\d)\b', re.I),
+]
+
+_PARSE_FORMATS = [
+    '%Y-%m-%d', '%Y/%m/%d',
+    '%d %B %Y', '%B %d, %Y', '%B %d %Y',
+    '%d %b %Y', '%b %d, %Y', '%b %d %Y',
+    '%B %Y', '%b %Y',
+]
+
+
+def _try_parse_date(text: str) -> Optional[datetime]:
+    cleaned = re.sub(r'(\d)(?:st|nd|rd|th)', r'\1', text)
+    for fmt in _PARSE_FORMATS:
+        try:
+            return datetime.strptime(cleaned, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def extract_document_date(file_path: Path, extracted_text: str = None) -> Optional[str]:
+    """
+    Determine document date. Large files get content-scanned for embedded dates
+    (common in Confluence exports). Smaller files fall back to file modification time.
+    """
+    file_size = file_path.stat().st_size
+    now = datetime.now()
+
+    if file_size > LARGE_FILE_THRESHOLD_BYTES and extracted_text:
+        sample = extracted_text[:10000]
+        found_dates = []
+        for pattern in _DATE_PATTERNS:
+            for m in pattern.finditer(sample):
+                parsed = _try_parse_date(m.group())
+                if parsed and parsed <= now:
+                    found_dates.append(parsed)
+        if found_dates:
+            return max(found_dates).strftime('%Y-%m-%d')
+
+    try:
+        mtime = file_path.stat().st_mtime
+        return datetime.fromtimestamp(mtime).strftime('%Y-%m-%d')
+    except Exception:
+        return None
+
+
 @dataclass
 class ProcessingStats:
     """Statistics for processing run."""
@@ -439,6 +503,10 @@ class FastDocumentProcessor:
                 print(f"  No content extracted from {file_path.name}")
                 return []
             
+            # Extract document date (content scan for large files, metadata for small)
+            combined_text = "\n".join(p["text"] for p in pages)
+            document_date = extract_document_date(file_path, combined_text)
+            
             # Generate chunks from extracted pages
             all_chunks = []
             file_hash = self.get_file_hash(file_path)
@@ -461,6 +529,7 @@ class FastDocumentProcessor:
                             "file_directory": str(file_path.parent.relative_to(self.input_dir)) if file_path.parent != self.input_dir else ".",
                             "file_size_bytes": file_path.stat().st_size,
                             "page_number": chunk["source_page"],
+                            "document_date": document_date,
                             "processed_timestamp": datetime.now().isoformat(),
                             "extraction_method": "ocr_fallback" if needs_ocr else "native"
                         }
@@ -655,6 +724,152 @@ class FastDocumentProcessor:
             df.to_csv(csv_path, index=False)
             print(f"Saved summary to: {csv_path}")
 
+    # =========================================================================
+    # ORGANIZED OUTPUT (GROUPED BY SOURCE, TEMPORAL ORDERING)
+    # =========================================================================
+
+    def save_organized(self, knowledge_base: Dict[str, Any], max_content_files: int = 9):
+        """
+        Save output as index + grouped content files + flat JSONL.
+        Groups chunks by source subfolder, capped at max_content_files.
+        Documents ordered newest-first within each file.
+        """
+        print(f"\nWriting organized output to: {self.output_dir}")
+
+        dir_groups: Dict[str, List[Dict[str, Any]]] = {}
+        for chunk in knowledge_base["chunks"]:
+            dir_key = chunk["metadata"]["file_directory"]
+            if dir_key not in dir_groups:
+                dir_groups[dir_key] = []
+            dir_groups[dir_key].append(chunk)
+
+        if len(dir_groups) > max_content_files:
+            dir_groups = self._merge_smallest_groups(dir_groups, max_content_files)
+
+        content_files_meta = []
+        for group_idx, (dir_name, chunks) in enumerate(
+            sorted(dir_groups.items(),
+                   key=lambda x: self._group_newest_date(x[1]),
+                   reverse=True),
+            start=1
+        ):
+            doc_map: Dict[str, List[Dict[str, Any]]] = {}
+            for chunk in chunks:
+                src = chunk["source_file"]
+                if src not in doc_map:
+                    doc_map[src] = []
+                doc_map[src].append(chunk)
+
+            documents = []
+            for src_file, doc_chunks in sorted(
+                doc_map.items(),
+                key=lambda x: x[1][0]["metadata"].get("document_date") or "0000-00-00",
+                reverse=True
+            ):
+                ordered = sorted(doc_chunks, key=lambda c: c["chunk_index"])
+                first = ordered[0]
+                pages = [c["metadata"].get("page_number") or 0 for c in ordered]
+                documents.append({
+                    "source_file": src_file,
+                    "filename": first["metadata"]["filename"],
+                    "document_date": first["metadata"].get("document_date"),
+                    "page_count": max(pages) if pages else 0,
+                    "chunk_count": len(ordered),
+                    "chunks": ordered
+                })
+
+            safe_name = self._sanitize_filename(dir_name if dir_name != "." else "root")
+            dates = [d["document_date"] for d in documents if d["document_date"]]
+            date_range = {
+                "earliest": min(dates) if dates else None,
+                "latest": max(dates) if dates else None
+            }
+
+            filename = f"{group_idx:02d}_{safe_name}.json"
+            content = {
+                "group": dir_name if dir_name != "." else "(root-level files)",
+                "document_count": len(documents),
+                "chunk_count": len(chunks),
+                "date_range": date_range,
+                "documents": documents
+            }
+
+            with open(self.output_dir / filename, 'w', encoding='utf-8') as f:
+                json.dump(content, f, indent=2, ensure_ascii=False)
+
+            content_files_meta.append({
+                "filename": filename,
+                "group": content["group"],
+                "document_count": len(documents),
+                "chunk_count": len(chunks),
+                "date_range": date_range,
+                "documents": [d["filename"] for d in documents]
+            })
+            print(f"  {filename} — {len(documents)} docs, {len(chunks)} chunks")
+
+        # Index file
+        all_dates = [
+            c["metadata"].get("document_date")
+            for c in knowledge_base["chunks"]
+            if c["metadata"].get("document_date")
+        ]
+        index = {
+            "description": (
+                f"Knowledge base from {knowledge_base['metadata']['successfully_processed']} documents "
+                f"in '{self.input_dir.name}'"
+            ),
+            "processed": knowledge_base["metadata"]["processing_timestamp"],
+            "total_documents": knowledge_base["metadata"]["successfully_processed"],
+            "total_chunks": knowledge_base["metadata"]["total_chunks"],
+            "date_range": {
+                "earliest": min(all_dates) if all_dates else None,
+                "latest": max(all_dates) if all_dates else None
+            },
+            "navigation": (
+                "Content files are numbered and ordered newest-first. "
+                "Start with file 01 for the most recent information. "
+                "Each file groups related documents from the same source folder."
+            ),
+            "files": content_files_meta,
+            "processing_stats": knowledge_base["metadata"],
+            "failed_files": knowledge_base["failed_files"]
+        }
+        with open(self.output_dir / "00_index.json", 'w', encoding='utf-8') as f:
+            json.dump(index, f, indent=2, ensure_ascii=False)
+        print(f"  00_index.json — manifest/navigation")
+
+        # Flat JSONL for programmatic/RAG pipeline use
+        jsonl_path = self.output_dir / "all_chunks.jsonl"
+        with open(jsonl_path, 'w', encoding='utf-8') as f:
+            for chunk in knowledge_base["chunks"]:
+                f.write(json.dumps(chunk, ensure_ascii=False) + '\n')
+        print(f"  all_chunks.jsonl — {len(knowledge_base['chunks'])} chunks (flat)")
+
+    def _merge_smallest_groups(
+        self, dir_groups: Dict[str, list], max_groups: int
+    ) -> Dict[str, list]:
+        while len(dir_groups) > max_groups:
+            sorted_by_size = sorted(dir_groups.items(), key=lambda x: len(x[1]))
+            smallest_key = sorted_by_size[0][0]
+            other_key = "_merged"
+            if other_key not in dir_groups:
+                dir_groups[other_key] = []
+            dir_groups[other_key].extend(dir_groups.pop(smallest_key))
+        return dir_groups
+
+    def _group_newest_date(self, chunks: List[Dict[str, Any]]) -> str:
+        dates = [
+            c["metadata"].get("document_date")
+            for c in chunks if c["metadata"].get("document_date")
+        ]
+        return max(dates) if dates else "0000-00-00"
+
+    @staticmethod
+    def _sanitize_filename(name: str) -> str:
+        safe = re.sub(r'[^\w\s-]', '', name).strip()
+        safe = re.sub(r'[\s]+', '_', safe)
+        return safe.lower()[:50] or "unnamed"
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -688,10 +903,16 @@ Examples:
     parser.add_argument("--no-ocr-fallback",
                        action="store_true",
                        help="Disable OCR fallback for scanned documents")
+    parser.add_argument("--flat",
+                       action="store_true",
+                       help="Use flat output (single knowledge_base.json) instead of organized multi-file output")
     parser.add_argument("--format", "-f", 
                        choices=["json", "jsonl", "both"], 
                        default="both",
-                       help="Output format (default: both)")
+                       help="Output format for --flat mode (default: both)")
+    parser.add_argument("--max-groups",
+                       type=int, default=9,
+                       help="Max content files in organized output (default: 9)")
     
     args = parser.parse_args()
     
@@ -709,7 +930,10 @@ Examples:
     knowledge_base = processor.process_all_documents(parallel=not args.no_parallel)
     
     # Save results
-    processor.save_knowledge_base(knowledge_base, args.format)
+    if args.flat:
+        processor.save_knowledge_base(knowledge_base, args.format)
+    else:
+        processor.save_organized(knowledge_base, max_content_files=args.max_groups)
     
     # Print summary
     meta = knowledge_base['metadata']
